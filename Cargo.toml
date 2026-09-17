@@ -3,6 +3,8 @@ name = "artifact-trust"
 version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
+repository = "https://github.com/scryer-media/artifact-trust"
+publish = false
 description = "Sigstore verification for signed application and plugin artifacts"
 
 [features]
