@@ -13,20 +13,6 @@ use const_oid::db::rfc5280::{ID_KP_CODE_SIGNING, ID_KP_TIME_STAMPING};
 use rustls_pki_types::{CertificateDer, TrustAnchor, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use sigstore::crypto::SigningScheme;
-use sigstore::{
-    crypto::{CosignVerificationKey, Signature},
-    trust::sigstore::SigstoreTrustRoot,
-};
-use sigstore_protobuf_specs::dev::sigstore::{
-    bundle::v1::{
-        Bundle as ProtoBundle, bundle::Content as ProtoBundleContent,
-        verification_material::Content as ProtoVerificationMaterial,
-    },
-    common::v1::HashAlgorithm as ProtoHashAlgorithm,
-    rekor::v1::{InclusionProof as ProtoInclusionProof, TransparencyLogEntry},
-};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{info, warn};
 use webpki::{EndEntityCert, KeyUsage};
@@ -43,7 +29,12 @@ use x509_cert::{
     },
 };
 
-use crate::{Error as AppError, RequiredSigner, Result as AppResult};
+use crate::{
+    Error as AppError, RequiredSigner, Result as AppResult,
+    sigstore_bundle::{self, Bundle, InclusionProof, TransparencyLogEntry},
+    tuf_refresh,
+    verification_key::VerificationKey,
+};
 
 const SIGSTORE_OIDC_ISSUER_OID: &str = "1.3.6.1.4.1.57264.1.1";
 const SIGSTORE_GITHUB_WORKFLOW_REPOSITORY_OID: &str = "1.3.6.1.4.1.57264.1.5";
@@ -79,7 +70,7 @@ const EMBEDDED_SIGSTORE_TRUST_ROOT_PROVENANCE: &[u8] = include_bytes!(concat!(
 ));
 
 struct TimedVerificationKey {
-    key: CosignVerificationKey,
+    key: VerificationKey,
     valid_for: TimeWindow,
     key_details: String,
 }
@@ -296,7 +287,7 @@ fn verify_v03_signed_blob(
     required_signer: &RequiredSigner,
     trust_material: &SigstoreTrustMaterial,
 ) -> AppResult<()> {
-    let bundle: ProtoBundle = serde_json::from_str(bundle_text).map_err(|error| {
+    let bundle = Bundle::from_json(bundle_text).map_err(|error| {
         AppError::Validation(format!("failed to parse Sigstore v0.3 bundle: {error}"))
     })?;
     if !matches!(
@@ -315,7 +306,7 @@ fn verify_v03_signed_blob(
     let rfc3161_timestamps = verification_material
         .timestamp_verification_data
         .as_ref()
-        .map(|timestamps| timestamps.rfc3161_timestamps.clone())
+        .map(|timestamps| timestamps.rfc3161_timestamps.as_slice())
         .unwrap_or_default();
     if rfc3161_timestamps.len() > 4 {
         return Err(AppError::Validation(
@@ -327,14 +318,10 @@ fn verify_v03_signed_blob(
             "Sigstore v0.3 bundle must contain exactly one transparency-log entry".to_string(),
         ));
     };
-    let certificate = match verification_material.content {
-        Some(ProtoVerificationMaterial::Certificate(certificate)) => certificate,
-        _ => {
-            return Err(AppError::Validation(
-                "Sigstore v0.3 keyless bundle must contain exactly one leaf certificate"
-                    .to_string(),
-            ));
-        }
+    let Some(certificate) = verification_material.certificate.as_ref() else {
+        return Err(AppError::Validation(
+            "Sigstore v0.3 keyless bundle must contain exactly one leaf certificate".to_string(),
+        ));
     };
     if certificate.raw_bytes.is_empty() {
         return Err(AppError::Validation(
@@ -342,13 +329,10 @@ fn verify_v03_signed_blob(
         ));
     }
 
-    let message_signature = match bundle.content {
-        Some(ProtoBundleContent::MessageSignature(signature)) => signature,
-        _ => {
-            return Err(AppError::Validation(
-                "Sigstore v0.3 plugin bundle must contain a message signature".to_string(),
-            ));
-        }
+    let Some(message_signature) = bundle.message_signature else {
+        return Err(AppError::Validation(
+            "Sigstore v0.3 plugin bundle must contain a message signature".to_string(),
+        ));
     };
     if message_signature.signature.is_empty() {
         return Err(AppError::Validation(
@@ -358,12 +342,12 @@ fn verify_v03_signed_blob(
     let message_digest = message_signature.message_digest.as_ref().ok_or_else(|| {
         AppError::Validation("Sigstore v0.3 bundle is missing its artifact digest".to_string())
     })?;
-    if message_digest.algorithm != ProtoHashAlgorithm::Sha2256 as i32 {
+    if message_digest.algorithm != sigstore_bundle::HashAlgorithm::Sha2_256 {
         return Err(AppError::Validation(
             "Sigstore v0.3 plugin bundle must identify the artifact with SHA-256".to_string(),
         ));
     }
-    if message_digest.digest.as_slice() != Sha256::digest(raw).as_slice() {
+    if *message_digest.digest != *Sha256::digest(raw) {
         return Err(AppError::Validation(
             "Sigstore v0.3 bundle digest does not match the plugin artifact".to_string(),
         ));
@@ -457,9 +441,9 @@ fn verify_v03_tlog_entry(
     })?;
     rekor_key
         .key
-        .verify_signature(
-            Signature::Raw(&inclusion_promise.signed_entry_timestamp),
+        .verify(
             &canonical_payload,
+            &inclusion_promise.signed_entry_timestamp,
         )
         .map_err(|error| {
             AppError::Validation(format!(
@@ -482,9 +466,9 @@ fn verify_v03_tlog_entry(
 }
 
 fn verify_v03_inclusion_proof(
-    proof: &ProtoInclusionProof,
+    proof: &InclusionProof,
     canonicalized_body: &[u8],
-    rekor_key: &CosignVerificationKey,
+    rekor_key: &VerificationKey,
     log_key_id: &[u8],
 ) -> AppResult<()> {
     let leaf_index = u64::try_from(proof.log_index).map_err(|_| {
@@ -532,7 +516,7 @@ fn verify_rekor_checkpoint(
     envelope: &str,
     proof_tree_size: u64,
     proof_root_hash: &[u8; 32],
-    rekor_key: &CosignVerificationKey,
+    rekor_key: &VerificationKey,
     log_key_id: &[u8],
 ) -> AppResult<()> {
     if envelope.contains('\r') {
@@ -607,7 +591,7 @@ fn verify_rekor_checkpoint(
         };
         if key_hint == expected_hint
             && rekor_key
-                .verify_signature(Signature::Raw(raw_signature), signed_note.as_bytes())
+                .verify(signed_note.as_bytes(), raw_signature)
                 .is_ok()
         {
             return Ok(());
@@ -1326,9 +1310,9 @@ fn parse_and_verify_bundle(
     }
     rekor_key
         .key
-        .verify_signature(
-            Signature::Base64Encoded(bundle.rekor_bundle.signed_entry_timestamp.as_bytes()),
+        .verify_base64(
             &canonical_payload,
+            &bundle.rekor_bundle.signed_entry_timestamp,
         )
         .map_err(|error| {
             AppError::Validation(format!(
@@ -1352,13 +1336,13 @@ fn verify_blob_signature(cert_pem: &str, base64_signature: &str, raw: &[u8]) -> 
             ))
         })?;
     let verification_key =
-        CosignVerificationKey::try_from_der(&subject_public_key_info).map_err(|error| {
+        VerificationKey::try_from_spki_der(&subject_public_key_info).map_err(|error| {
             AppError::Validation(format!(
                 "failed to parse Sigstore certificate public key: {error}"
             ))
         })?;
     verification_key
-        .verify_signature(Signature::Base64Encoded(base64_signature.as_bytes()), raw)
+        .verify_base64(raw, base64_signature)
         .map_err(|error| {
             AppError::Validation(format!(
                 "Sigstore blob signature verification failed: {error}"
@@ -1624,10 +1608,7 @@ fn verify_embedded_sct(
 
     ctfe_key
         .key
-        .verify_signature(
-            Signature::Raw(sct.signature.signature.as_slice()),
-            &signed_data,
-        )
+        .verify(&signed_data, sct.signature.signature.as_slice())
         .map_err(|error| {
             AppError::Validation(format!(
                 "Sigstore certificate SCT verification failed: {error}"
@@ -1756,21 +1737,10 @@ fn load_sigstore_trust_material_from_snapshot(
 }
 
 async fn retrieve_sigstore_trust_material() -> AppResult<CachedSigstoreTrustMaterial> {
-    let cache_dir = tempfile::tempdir().map_err(|error| {
-        AppError::Repository(format!(
-            "failed to create temporary Sigstore trust-root cache: {error}"
-        ))
-    })?;
-    let _trust_root = SigstoreTrustRoot::new(Some(cache_dir.path()))
+    let trusted_root_json = tuf_refresh::fetch_trusted_root_json()
         .await
         .map_err(|error| {
             AppError::Repository(format!("failed to load Sigstore trust root: {error}"))
-        })?;
-    let trusted_root_json =
-        std::fs::read(cache_dir.path().join("trusted_root.json")).map_err(|error| {
-            AppError::Repository(format!(
-                "failed to read TUF-verified Sigstore trusted_root.json: {error}"
-            ))
         })?;
     let digest = lower_hex(&Sha256::digest(&trusted_root_json));
     let material = Arc::new(parse_trusted_root_document(&trusted_root_json)?);
@@ -1846,7 +1816,7 @@ fn parse_trusted_log_keys(
             &log.public_key.raw_bytes,
             &format!("{label} public key '{key_id}'"),
         )?;
-        let key = CosignVerificationKey::try_from_der(&key_der).map_err(|error| {
+        let key = VerificationKey::try_from_spki_der(&key_der).map_err(|error| {
             AppError::Repository(format!(
                 "failed to parse Sigstore {label} public key '{key_id}': {error}"
             ))
@@ -2265,12 +2235,38 @@ fn cert_subject_uris(cert: &Certificate) -> AppResult<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::{
+        rand::SystemRandom,
+        signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
+    };
+
     use super::*;
 
+    struct TestRekorSigner(EcdsaKeyPair);
+
+    impl TestRekorSigner {
+        fn generate() -> Self {
+            Self(
+                EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+                    .expect("generate test Rekor key"),
+            )
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, aws_lc_rs::error::Unspecified> {
+            Ok(self
+                .0
+                .sign(&SystemRandom::new(), message)?
+                .as_ref()
+                .to_vec())
+        }
+
+        fn verification_key(&self) -> VerificationKey {
+            VerificationKey::ecdsa_p256_from_uncompressed_point(self.0.public_key().as_ref())
+        }
+    }
+
     fn signed_rekor_bundle() -> (String, RekorVerificationKeys) {
-        let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
-            .create_signer()
-            .expect("create test Rekor signer");
+        let signer = TestRekorSigner::generate();
         let payload = RekorPayload {
             body: base64::engine::general_purpose::STANDARD.encode(b"{}"),
             integrated_time: 1_700_000_000,
@@ -2296,9 +2292,7 @@ mod tests {
         let keys = BTreeMap::from([(
             "test-rekor-key".to_string(),
             TimedVerificationKey {
-                key: signer
-                    .to_verification_key()
-                    .expect("derive test Rekor verification key"),
+                key: signer.verification_key(),
                 valid_for: TimeWindow::default(),
                 key_details: "PKIX_ECDSA_P256_SHA_256".to_string(),
             },
@@ -2311,9 +2305,7 @@ mod tests {
         integrated_time: i64,
         log_index: i64,
     ) -> (serde_json::Value, RekorVerificationKeys) {
-        let signer = SigningScheme::ECDSA_P256_SHA256_ASN1
-            .create_signer()
-            .expect("create test Rekor signer");
+        let signer = TestRekorSigner::generate();
         let log_key_id = [7_u8; 32];
         let log_id_hex = lower_hex(&log_key_id);
         let payload = RekorPayload {
@@ -2372,9 +2364,7 @@ mod tests {
         let keys = BTreeMap::from([(
             log_id_hex,
             TimedVerificationKey {
-                key: signer
-                    .to_verification_key()
-                    .expect("derive v0.3 Rekor verification key"),
+                key: signer.verification_key(),
                 valid_for: TimeWindow::default(),
                 key_details: "PKIX_ECDSA_P256_SHA_256".to_string(),
             },
@@ -2827,5 +2817,18 @@ mod binding_tests {
             verify_rekor_hashedrekord_binding(raw, &signature, cert_pem, &certificate_body)
                 .expect_err("Rekor certificate must bind to the bundle certificate");
         assert!(certificate_error.to_string().contains("certificate"));
+    }
+
+    /// Talks to the real Sigstore TUF CDN.
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn live_tuf_refresh_yields_usable_trust_material() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let refreshed = retrieve_sigstore_trust_material()
+            .await
+            .expect("refresh Sigstore trust material over TUF");
+        assert!(!refreshed.material.rekor_keys.is_empty());
+        assert!(!refreshed.material.ctfe_keys.is_empty());
+        assert!(refreshed.refreshed_at.is_some());
     }
 }

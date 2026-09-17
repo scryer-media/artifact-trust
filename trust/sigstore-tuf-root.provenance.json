@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "sha256": "5fe1e509a47277183a004745942c0a116379297da9f1cca529774320f1a5dfab",
+  "source": "sigstore 0.14.0 crate (crates.io), trust_root/prod/root.json",
+  "tufRootVersion": 12,
+  "note": "Byte-identical to the TUF trust anchor this crate used through sigstore 0.14.0 before depending on tough directly."
+}

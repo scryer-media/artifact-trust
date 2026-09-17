@@ -21,6 +21,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "verification")]
+mod sigstore_bundle;
+#[cfg(feature = "verification")]
+mod tuf_refresh;
+#[cfg(feature = "verification")]
 mod verification;
+#[cfg(feature = "verification")]
+mod verification_key;
 #[cfg(feature = "verification")]
 pub use verification::{prime_sigstore_trust_roots, verify_signed_blob};

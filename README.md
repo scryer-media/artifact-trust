@@ -25,6 +25,11 @@ requiring a network refresh. `prime_sigstore_trust_roots` refreshes through
 Sigstore's TUF verification and retains the current snapshot on failure. Hosts
 initialize their TLS crypto provider before requesting a network refresh.
 
+The refresh uses `tough` directly, anchored on `trust/sigstore-tuf-root.json`
+(the Sigstore public-good TUF root, version 12). `tough` walks the root chain
+forward from that anchor, so a later root is only accepted when the previous one
+signed it. It is fetched over HTTPS only.
+
 `trust/` includes the snapshot and its source/digest provenance. The snapshot was
 materialized by Scryer's signature-verifying built-in preparation workflow.
 Signed test fixtures are retained byte-for-byte; their Scryer/plugin identities
