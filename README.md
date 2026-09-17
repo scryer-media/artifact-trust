@@ -23,7 +23,8 @@ are not accepted.
   Sigstore trusted root.
 - An embedded trusted-root snapshot, so verification needs no network, and an
   optional TUF-verified refresh (`prime_sigstore_trust_roots`) that keeps the
-  current snapshot when the refresh fails.
+  current snapshot when the refresh fails. `refresh_sigstore_trusted_root` does
+  the same and returns the verified `trusted_root.json` for release tooling.
 - `default-features = false` exposes only the signer requirements and error
   types, with none of the verification dependencies.
 
@@ -63,7 +64,7 @@ It is not published to crates.io; the manifest sets `publish = false`.
 
 ```toml
 [dependencies]
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.0" }
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.1" }
 ```
 
 Tags are signed, annotated, and immutable: never move an existing version tag.
@@ -79,7 +80,7 @@ cargo nextest run --locked --no-fail-fast
 cargo check --locked --no-default-features
 ```
 
-The default test run is offline. Two `#[ignore]`d tests perform a live TUF
+The default test run is offline. Three `#[ignore]`d tests perform a live TUF
 refresh against the Sigstore public-good repository; run them with
 `cargo test -- --ignored`. No application instance is required.
 

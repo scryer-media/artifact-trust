@@ -111,6 +111,9 @@ struct CachedSigstoreTrustMaterial {
     digest: String,
     source: String,
     refreshed_at: Option<Instant>,
+    /// The TUF-verified `trusted_root.json` this entry was parsed from; `None`
+    /// for the embedded snapshot.
+    refreshed_json: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1778,6 +1781,7 @@ fn load_sigstore_trust_material_from_snapshot(
         digest,
         source,
         refreshed_at: None,
+        refreshed_json: None,
     })
 }
 
@@ -1794,6 +1798,7 @@ async fn retrieve_sigstore_trust_material() -> AppResult<CachedSigstoreTrustMate
         digest,
         source: SIGSTORE_TRUST_SOURCE.to_string(),
         refreshed_at: Some(Instant::now()),
+        refreshed_json: Some(Arc::from(trusted_root_json)),
     })
 }
 
@@ -2048,6 +2053,27 @@ pub async fn prime_sigstore_trust_roots() -> AppResult<()> {
     drop(refresh_guard);
     info!(%digest, %source, duration_ms, outcome = "success", "refreshed Sigstore trust material");
     Ok(())
+}
+
+/// Refreshes the trust material like [`prime_sigstore_trust_roots`] and returns
+/// the TUF-verified `trusted_root.json` now in use, for release tooling that
+/// materializes the snapshot an application embeds. Fails, leaving the current
+/// snapshot in place, when the refresh fails.
+pub async fn refresh_sigstore_trusted_root() -> AppResult<Vec<u8>> {
+    prime_sigstore_trust_roots().await?;
+    sigstore_trust_material_cache()?
+        .read()
+        .map_err(|_| {
+            AppError::Repository("Sigstore trust-root cache lock is poisoned".to_string())
+        })?
+        .refreshed_json
+        .as_deref()
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            AppError::Repository(
+                "Sigstore trust material was not refreshed from the network".to_string(),
+            )
+        })
 }
 
 #[derive(Debug, Default)]
@@ -2897,5 +2923,18 @@ mod binding_tests {
         assert!(!refreshed.material.rekor_keys.is_empty());
         assert!(!refreshed.material.ctfe_keys.is_empty());
         assert!(refreshed.refreshed_at.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn live_refresh_returns_the_trusted_root_now_in_use() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let json = refresh_sigstore_trusted_root()
+            .await
+            .expect("refresh and export the Sigstore trusted root");
+        parse_trusted_root_document(&json).expect("exported trusted root parses");
+        let cache = sigstore_trust_material_cache().expect("trust material cache");
+        let cached = cache.read().expect("cache lock");
+        assert_eq!(cached.digest, lower_hex(&Sha256::digest(&json)));
     }
 }

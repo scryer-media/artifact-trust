@@ -29,4 +29,6 @@ mod verification;
 #[cfg(feature = "verification")]
 mod verification_key;
 #[cfg(feature = "verification")]
-pub use verification::{prime_sigstore_trust_roots, verify_signed_blob};
+pub use verification::{
+    prime_sigstore_trust_roots, refresh_sigstore_trusted_root, verify_signed_blob,
+};
