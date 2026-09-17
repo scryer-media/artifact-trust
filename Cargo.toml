@@ -7,7 +7,7 @@ description = "Sigstore verification for signed application and plugin artifacts
 
 [features]
 default = ["verification"]
-verification = ["dep:aws-lc-rs", "dep:base64", "dep:chrono", "dep:const-oid", "dep:futures-core", "dep:reqwest", "dep:rustls-pki-types", "dep:rustls-webpki", "dep:serde_json", "dep:serde_json_canonicalizer", "dep:sha2", "dep:tokio", "dep:tough", "dep:tracing", "dep:url", "dep:x509-cert"]
+verification = ["dep:aws-lc-rs", "dep:base64", "dep:chrono", "dep:const-oid", "dep:der", "dep:futures-core", "dep:reqwest", "dep:rustls-pki-types", "dep:rustls-webpki", "dep:serde_json", "dep:serde_json_canonicalizer", "dep:sha2", "dep:tokio", "dep:tough", "dep:tracing", "dep:url", "dep:x509-cert"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -16,6 +16,8 @@ aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips"
 base64 = { version = "0.22", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 const-oid = { version = "0.10.2", features = ["db"], optional = true }
+# The `der` x509-cert already builds; named so the precertificate TBS can derive `Sequence`.
+der = { version = "0.8", features = ["derive"], optional = true }
 futures-core = { version = "0.3", optional = true }
 # TLS comes from the host: it installs the rustls crypto provider before any refresh.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"], optional = true }
@@ -28,7 +30,7 @@ tokio = { version = "1.53", features = ["fs", "io-util", "macros", "net", "proce
 tough = { version = "0.22", default-features = false, optional = true }
 tracing = { version = "0.1", optional = true }
 url = { version = "2", optional = true }
-x509-cert = { version = "0.2", default-features = false, features = ["pem", "sct", "std"], optional = true }
+x509-cert = { version = "0.3", default-features = false, features = ["pem", "sct", "std"], optional = true }
 
 [dev-dependencies]
 # Only the ignored live TUF refresh test needs a TLS provider of its own.

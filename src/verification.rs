@@ -723,13 +723,17 @@ fn verify_rfc3161_timestamp(
                 "failed to parse Sigstore timestamp signer certificate: {error}"
             ))
         })?;
-        let signer_issuer = signer.tbs_certificate.issuer.to_der().map_err(|error| {
-            AppError::Validation(format!(
-                "failed to encode Sigstore timestamp signer issuer: {error}"
-            ))
-        })?;
+        let signer_issuer = signer
+            .tbs_certificate()
+            .issuer()
+            .to_der()
+            .map_err(|error| {
+                AppError::Validation(format!(
+                    "failed to encode Sigstore timestamp signer issuer: {error}"
+                ))
+            })?;
         if signer_issuer != parsed.signer_issuer
-            || signer.tbs_certificate.serial_number.as_bytes() != parsed.signer_serial
+            || signer.tbs_certificate().serial_number().as_bytes() != parsed.signer_serial
         {
             continue;
         }
@@ -755,8 +759,8 @@ fn verify_rfc3161_timestamp(
             continue;
         }
         let signer_spki = signer
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .to_der()
             .map_err(|error| {
                 AppError::Validation(format!(
@@ -1327,8 +1331,8 @@ fn verify_blob_signature(cert_pem: &str, base64_signature: &str, raw: &[u8]) -> 
         AppError::Validation(format!("failed to parse Sigstore certificate: {error}"))
     })?;
     let subject_public_key_info = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|error| {
             AppError::Validation(format!(
@@ -1510,8 +1514,8 @@ fn verify_embedded_sct(
     rekor_time: i64,
 ) -> AppResult<()> {
     let sct_list = cert
-        .tbs_certificate
-        .get::<SignedCertificateTimestampList>()
+        .tbs_certificate()
+        .get_extension::<SignedCertificateTimestampList>()
         .map_err(|error| {
             AppError::Validation(format!("failed to read Sigstore certificate SCT: {error}"))
         })?
@@ -1571,8 +1575,8 @@ fn verify_embedded_sct(
         AppError::Validation(format!("failed to parse Sigstore Fulcio issuer: {error}"))
     })?;
     let issuer_spki = issuer
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|error| {
             AppError::Validation(format!(
@@ -1581,13 +1585,7 @@ fn verify_embedded_sct(
         })?;
     let issuer_key_hash = Sha256::digest(&issuer_spki);
 
-    let mut precert = cert.tbs_certificate.clone();
-    precert.extensions = precert.extensions.map(|extensions| {
-        extensions
-            .into_iter()
-            .filter(|extension| extension.extn_id.to_string() != "1.3.6.1.4.1.11129.2.4.2")
-            .collect()
-    });
+    let precert = PrecertificateTbs::without_sct_list(cert.tbs_certificate());
     let precert_der = precert.to_der().map_err(|error| {
         AppError::Validation(format!(
             "failed to reconstruct Sigstore precertificate: {error}"
@@ -1614,6 +1612,53 @@ fn verify_embedded_sct(
                 "Sigstore certificate SCT verification failed: {error}"
             ))
         })
+}
+
+/// The `TBSCertificate` a CT log signed: the issued certificate's, minus the
+/// embedded SCT list (RFC 6962 section 3.2). x509-cert exposes its own
+/// `TbsCertificate` read-only, so the precertificate form is re-encoded here
+/// field for field, in RFC 5280 section 4.1 order.
+#[derive(der::Sequence)]
+struct PrecertificateTbs {
+    #[asn1(context_specific = "0", default = "Default::default")]
+    version: x509_cert::Version,
+    serial_number: x509_cert::serial_number::SerialNumber,
+    signature: x509_cert::spki::AlgorithmIdentifierOwned,
+    issuer: x509_cert::name::Name,
+    validity: x509_cert::time::Validity,
+    subject: x509_cert::name::Name,
+    subject_public_key_info: x509_cert::spki::SubjectPublicKeyInfoOwned,
+    #[asn1(context_specific = "1", tag_mode = "IMPLICIT", optional = "true")]
+    issuer_unique_id: Option<der::asn1::BitString>,
+    #[asn1(context_specific = "2", tag_mode = "IMPLICIT", optional = "true")]
+    subject_unique_id: Option<der::asn1::BitString>,
+    #[asn1(context_specific = "3", tag_mode = "EXPLICIT", optional = "true")]
+    extensions: Option<x509_cert::ext::Extensions>,
+}
+
+impl PrecertificateTbs {
+    const SCT_LIST_OID: &'static str = "1.3.6.1.4.1.11129.2.4.2";
+
+    fn without_sct_list(tbs: &x509_cert::TbsCertificate) -> Self {
+        Self {
+            version: tbs.version(),
+            serial_number: tbs.serial_number().clone(),
+            signature: tbs.signature().clone(),
+            issuer: tbs.issuer().clone(),
+            validity: *tbs.validity(),
+            subject: tbs.subject().clone(),
+            subject_public_key_info: tbs.subject_public_key_info().clone(),
+            issuer_unique_id: tbs.issuer_unique_id().clone(),
+            subject_unique_id: tbs.subject_unique_id().clone(),
+            extensions: tbs.extensions().map(|extensions| {
+                extensions
+                    .iter()
+                    .filter(|extension| extension.extn_id.to_string() != Self::SCT_LIST_OID)
+                    .cloned()
+                    .collect()
+            }),
+        }
+    }
 }
 
 fn verify_sct_algorithm(
@@ -1891,7 +1936,7 @@ fn x509_certificate_validity(cert_der: &CertificateDer<'_>) -> AppResult<TimeWin
             "failed to parse Sigstore Fulcio certificate validity: {error}"
         ))
     })?;
-    let validity = &cert.tbs_certificate.validity;
+    let validity = &cert.tbs_certificate().validity();
     let start = i64::try_from(validity.not_before.to_unix_duration().as_secs()).map_err(|_| {
         AppError::Repository("Sigstore Fulcio certificate notBefore is out of range".to_string())
     })?;
@@ -2171,7 +2216,7 @@ pub(super) fn pem_encode_certificate(der: &[u8]) -> String {
 }
 
 fn cert_extension<'a>(cert: &'a Certificate, oid: &str) -> AppResult<Option<&'a Extension>> {
-    let Some(extensions) = cert.tbs_certificate.extensions.as_deref() else {
+    let Some(extensions) = cert.tbs_certificate().extensions() else {
         return Ok(None);
     };
     let mut matches = extensions
@@ -2216,8 +2261,8 @@ fn cert_extension_der_utf8(cert: &Certificate, oid: &str) -> AppResult<Option<St
 
 fn cert_subject_uris(cert: &Certificate) -> AppResult<Vec<String>> {
     let san = cert
-        .tbs_certificate
-        .get::<SubjectAltName>()
+        .tbs_certificate()
+        .get_extension::<SubjectAltName>()
         .map_err(|error| AppError::Validation(format!("failed to read certificate SAN: {error}")))?
         .map(|(_, san)| san);
     let Some(san) = san else {
