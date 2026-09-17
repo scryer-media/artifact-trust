@@ -2055,6 +2055,34 @@ pub async fn prime_sigstore_trust_roots() -> AppResult<()> {
     Ok(())
 }
 
+/// Replaces the crate's embedded trust snapshot with one the host ships, for
+/// applications that materialize a fresh TUF-verified snapshot at release time.
+/// `provenance_json` is the receipt written beside it; the snapshot is rejected
+/// unless it matches the receipt's SHA-256 and parses completely. Trust material
+/// already refreshed from the network is newer and stays in use.
+pub fn install_sigstore_trust_snapshot(root: &[u8], provenance_json: &[u8]) -> AppResult<()> {
+    let snapshot = load_sigstore_trust_material_from_snapshot(root, provenance_json)?;
+    let digest = snapshot.digest.clone();
+    let source = snapshot.source.clone();
+    let snapshot = match SIGSTORE_TRUST_MATERIAL.set(RwLock::new(snapshot)) {
+        Ok(()) => {
+            info!(%digest, %source, "installed host Sigstore trust snapshot");
+            return Ok(());
+        }
+        Err(snapshot) => snapshot.into_inner().map_err(|_| {
+            AppError::Repository("Sigstore trust-root cache lock is poisoned".to_string())
+        })?,
+    };
+    let mut cache = sigstore_trust_material_cache()?.write().map_err(|_| {
+        AppError::Repository("Sigstore trust-root cache lock is poisoned".to_string())
+    })?;
+    if cache.refreshed_at.is_none() {
+        *cache = snapshot;
+        info!(%digest, %source, "installed host Sigstore trust snapshot");
+    }
+    Ok(())
+}
+
 /// Refreshes the trust material like [`prime_sigstore_trust_roots`] and returns
 /// the TUF-verified `trusted_root.json` now in use, for release tooling that
 /// materializes the snapshot an application embeds. Fails, leaving the current
@@ -2913,6 +2941,28 @@ mod binding_tests {
     }
 
     /// Talks to the real Sigstore TUF CDN.
+    #[test]
+    fn host_snapshot_is_validated_against_its_receipt() {
+        let mut tampered = EMBEDDED_SIGSTORE_TRUST_ROOT.to_vec();
+        tampered[0] ^= 1;
+        let error =
+            install_sigstore_trust_snapshot(&tampered, EMBEDDED_SIGSTORE_TRUST_ROOT_PROVENANCE)
+                .expect_err("a snapshot that does not match its receipt must be refused");
+        assert!(error.to_string().contains("digest mismatch"));
+
+        install_sigstore_trust_snapshot(
+            EMBEDDED_SIGSTORE_TRUST_ROOT,
+            EMBEDDED_SIGSTORE_TRUST_ROOT_PROVENANCE,
+        )
+        .expect("a snapshot matching its receipt installs");
+        assert!(
+            !current_sigstore_trust_material()
+                .unwrap()
+                .rekor_keys
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     #[ignore = "network"]
     async fn live_tuf_refresh_yields_usable_trust_material() {
