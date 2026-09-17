@@ -2515,6 +2515,28 @@ mod tests {
         );
     }
 
+    /// The public entry point picks the verifier from the bundle's shape, so a
+    /// real Cosign v2 bundle must get through it just as the Cosign v3 one does.
+    #[tokio::test]
+    async fn legacy_real_cosign_v2_bundle_verifies_through_the_public_entry_point() {
+        let raw = include_bytes!("../test-fixtures/scryer-upgrade-manifest-v0.19.3.json");
+        let bundle =
+            include_bytes!("../test-fixtures/scryer-upgrade-manifest-v0.19.3.sigstore.json");
+
+        verify_signed_blob(raw.to_vec(), bundle.to_vec(), required_github_signer())
+            .await
+            .expect("real Cosign v2 bundle should verify");
+
+        let mut altered = raw.to_vec();
+        altered[0] ^= 1;
+        assert!(
+            verify_signed_blob(altered, bundle.to_vec(), required_github_signer())
+                .await
+                .is_err(),
+            "real Cosign v2 artifact tampering must fail closed"
+        );
+    }
+
     #[tokio::test]
     async fn v03_real_cosign_plugin_bundle_verifies_with_rfc3161_timestamp() {
         let raw = include_bytes!("../test-fixtures/fanzub-catalog-v2.1.0.json");
