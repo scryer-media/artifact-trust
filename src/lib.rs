@@ -30,6 +30,6 @@ mod verification;
 mod verification_key;
 #[cfg(feature = "verification")]
 pub use verification::{
-    install_sigstore_trust_snapshot, prime_sigstore_trust_roots, refresh_sigstore_trusted_root,
-    verify_signed_blob,
+    install_sigstore_trust_snapshot, prime_sigstore_trust_roots, prime_sigstore_trust_roots_with,
+    refresh_sigstore_trusted_root, refresh_sigstore_trusted_root_with, verify_signed_blob,
 };

@@ -25,6 +25,7 @@ are not accepted.
   optional TUF-verified refresh (`prime_sigstore_trust_roots`) that keeps the
   current snapshot when the refresh fails. `refresh_sigstore_trusted_root` does
   the same and returns the verified `trusted_root.json` for release tooling.
+  Their `_with` forms fetch over a `reqwest::Client` the host supplies.
 - `install_sigstore_trust_snapshot` lets the host substitute the snapshot it
   materialized at release time, checked against its SHA-256 receipt.
 - `default-features = false` exposes only the signer requirements and error
@@ -66,7 +67,7 @@ It is not published to crates.io; the manifest sets `publish = false`.
 
 ```toml
 [dependencies]
-artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.2" }
+artifact-trust = { git = "https://github.com/scryer-media/artifact-trust.git", tag = "v0.1.3" }
 ```
 
 Tags are signed, annotated, and immutable: never move an existing version tag.

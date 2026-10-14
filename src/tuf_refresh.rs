@@ -24,16 +24,23 @@ const EMBEDDED_SIGSTORE_TUF_ROOT: &[u8] = include_bytes!(concat!(
     "/trust/sigstore-tuf-root.json"
 ));
 
-pub(crate) async fn fetch_trusted_root_json() -> Result<Vec<u8>, String> {
+/// Fetches over `client` when the host supplies one, otherwise over a plain
+/// client of the crate's own.
+pub(crate) async fn fetch_trusted_root_json(
+    client: Option<reqwest::Client>,
+) -> Result<Vec<u8>, String> {
     let metadata_base = Url::parse(SIGSTORE_TUF_METADATA_BASE)
         .map_err(|error| format!("invalid Sigstore TUF metadata URL: {error}"))?;
     let target_base = Url::parse(SIGSTORE_TUF_TARGET_BASE)
         .map_err(|error| format!("invalid Sigstore TUF target URL: {error}"))?;
 
-    // `Client::new` panics when the host has not installed a TLS provider.
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(|error| format!("failed to build the Sigstore TUF HTTP client: {error}"))?;
+    let client = match client {
+        Some(client) => client,
+        // `Client::new` panics when the host has not installed a TLS provider.
+        None => reqwest::Client::builder()
+            .build()
+            .map_err(|error| format!("failed to build the Sigstore TUF HTTP client: {error}"))?,
+    };
     let repository = RepositoryLoader::new(&EMBEDDED_SIGSTORE_TUF_ROOT, metadata_base, target_base)
         .transport(HttpsTransport { client })
         .expiration_enforcement(ExpirationEnforcement::Safe)
@@ -125,7 +132,7 @@ mod tests {
     #[ignore = "network"]
     async fn live_refresh_returns_a_tuf_verified_trusted_root() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let raw = fetch_trusted_root_json()
+        let raw = fetch_trusted_root_json(None)
             .await
             .expect("fetch TUF-verified trusted_root.json");
         let document: serde_json::Value =

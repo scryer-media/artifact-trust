@@ -1785,12 +1785,15 @@ fn load_sigstore_trust_material_from_snapshot(
     })
 }
 
-async fn retrieve_sigstore_trust_material() -> AppResult<CachedSigstoreTrustMaterial> {
-    let trusted_root_json = tuf_refresh::fetch_trusted_root_json()
-        .await
-        .map_err(|error| {
-            AppError::Repository(format!("failed to load Sigstore trust root: {error}"))
-        })?;
+async fn retrieve_sigstore_trust_material(
+    client: Option<reqwest::Client>,
+) -> AppResult<CachedSigstoreTrustMaterial> {
+    let trusted_root_json =
+        tuf_refresh::fetch_trusted_root_json(client)
+            .await
+            .map_err(|error| {
+                AppError::Repository(format!("failed to load Sigstore trust root: {error}"))
+            })?;
     let digest = lower_hex(&Sha256::digest(&trusted_root_json));
     let material = Arc::new(parse_trusted_root_document(&trusted_root_json)?);
     Ok(CachedSigstoreTrustMaterial {
@@ -1985,6 +1988,17 @@ fn decode_trusted_root_base64(value: &str, label: &str) -> AppResult<Vec<u8>> {
 }
 
 pub async fn prime_sigstore_trust_roots() -> AppResult<()> {
+    prime_sigstore_trust_roots_over(None).await
+}
+
+/// Refreshes the trust material like [`prime_sigstore_trust_roots`], fetching
+/// over `client`, for hosts that send their outbound HTTPS a particular way.
+/// The client must reach the Sigstore TUF repository over HTTPS.
+pub async fn prime_sigstore_trust_roots_with(client: reqwest::Client) -> AppResult<()> {
+    prime_sigstore_trust_roots_over(Some(client)).await
+}
+
+async fn prime_sigstore_trust_roots_over(client: Option<reqwest::Client>) -> AppResult<()> {
     let cache = sigstore_trust_material_cache()?;
     let requested_at = Instant::now();
     let refresh_guard = SIGSTORE_TRUST_REFRESH
@@ -2007,7 +2021,7 @@ pub async fn prime_sigstore_trust_roots() -> AppResult<()> {
     let started_at = Instant::now();
     let refresh_result = tokio::time::timeout(
         SIGSTORE_TRUST_REFRESH_TIMEOUT,
-        retrieve_sigstore_trust_material(),
+        retrieve_sigstore_trust_material(client),
     )
     .await;
     let duration_ms = started_at.elapsed().as_millis();
@@ -2088,7 +2102,17 @@ pub fn install_sigstore_trust_snapshot(root: &[u8], provenance_json: &[u8]) -> A
 /// materializes the snapshot an application embeds. Fails, leaving the current
 /// snapshot in place, when the refresh fails.
 pub async fn refresh_sigstore_trusted_root() -> AppResult<Vec<u8>> {
-    prime_sigstore_trust_roots().await?;
+    refresh_sigstore_trusted_root_over(None).await
+}
+
+/// Refreshes and returns the trusted root like
+/// [`refresh_sigstore_trusted_root`], fetching over `client`.
+pub async fn refresh_sigstore_trusted_root_with(client: reqwest::Client) -> AppResult<Vec<u8>> {
+    refresh_sigstore_trusted_root_over(Some(client)).await
+}
+
+async fn refresh_sigstore_trusted_root_over(client: Option<reqwest::Client>) -> AppResult<Vec<u8>> {
+    prime_sigstore_trust_roots_over(client).await?;
     sigstore_trust_material_cache()?
         .read()
         .map_err(|_| {
@@ -2964,10 +2988,50 @@ mod binding_tests {
     }
 
     #[tokio::test]
+    async fn a_refresh_goes_out_over_the_client_the_host_hands_it() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // The host's client sends everything to a proxy that hangs up, so the
+        // refresh only reaches it by using that client, and then fails.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let client = reqwest::Client::builder()
+            .proxy(
+                reqwest::Proxy::all(format!(
+                    "http://{}",
+                    proxy.local_addr().expect("proxy addr")
+                ))
+                .expect("proxy"),
+            )
+            .build()
+            .expect("host client");
+        let refresh = prime_sigstore_trust_roots_with(client);
+        tokio::pin!(refresh);
+        let mut connections = 0;
+        let result = loop {
+            tokio::select! {
+                result = &mut refresh => break result,
+                accepted = proxy.accept() => {
+                    drop(accepted.expect("accept"));
+                    connections += 1;
+                }
+            }
+        };
+        assert!(
+            connections > 0,
+            "the refresh must dial over the host's client"
+        );
+        assert!(
+            result.is_err(),
+            "a refresh whose transport hung up must fail"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "network"]
     async fn live_tuf_refresh_yields_usable_trust_material() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let refreshed = retrieve_sigstore_trust_material()
+        let refreshed = retrieve_sigstore_trust_material(None)
             .await
             .expect("refresh Sigstore trust material over TUF");
         assert!(!refreshed.material.rekor_keys.is_empty());
